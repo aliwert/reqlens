@@ -35,12 +35,6 @@ function formatBytes(bytes: number | null): string {
   return `${(bytes / 1024).toFixed(1)}kB`;
 }
 
-function padEnd(str: string, length: number): string {
-  const visible = stripAnsi(str);
-  const pad = Math.max(0, length - visible.length);
-  return str + " ".repeat(pad);
-}
-
 function stripAnsi(str: string): string {
   // eslint-disable-next-line no-control-regex
   return str.replace(/\x1B\[[0-9;]*m/g, "");
@@ -124,33 +118,41 @@ export function formatFull(
 ): string {
   const theme = themes[opts.theme];
   const width = Math.min(terminalWidth(), 110);
-  const inner = width - 4; // 2 border + 2 padding
+
+  // inner: usable chars between the two border │ characters.
+  // Content rows go through pad() which prepends one space, so they have
+  // (inner - 1) chars of actual content space. Defined here for those rows.
+  const inner = width - 2;
 
   const mColor = methodColor(entry.method, theme);
   const sColor = statusColor(entry.statusCode, theme);
 
   const lines: string[] = [];
-  const bc = theme.border; // border color shorthand
+  const bc = theme.border;
 
+  // pad() wraps content with one leading space inside the border
   const pad = (content: string) => boxLine(" " + content, width, bc);
 
   // ── TOP BAR ──────────────────────────────────────────────────────────────
+  // Top bar does NOT go through pad(), so it fills the full (inner) chars
+  // between the two │ borders — do NOT subtract any extra padding here.
   const labelStr = hex(theme.label)("◈ " + opts.label);
   const tsStr = hex(theme.dim)(entry.timestamp.toLocaleTimeString());
   const ipStr = hex(theme.dim)(entry.ip);
-  const topRight = tsStr + hex(theme.dim)("  ·  ") + ipStr + " ";
+  const separator = hex(theme.dim)(" · ");
 
-  const topMiddle = ` ${labelStr}`;
-  const topRightPadded =
-    " ".repeat(
-      Math.max(
-        0,
-        inner - stripAnsi(topMiddle).length - stripAnsi(topRight).length,
-      ),
-    ) + topRight;
+  const topLeft = " " + labelStr;
+  const topRight = tsStr + separator + ipStr + " ";
+
+  const topLeftLen = stripAnsi(topLeft).length;
+  const topRightLen = stripAnsi(topRight).length;
+
+  // inner = width - 2: exactly the space between the two │ chars
+  const gapNeeded = Math.max(1, inner - topLeftLen - topRightLen);
+  const topContent = topLeft + " ".repeat(gapNeeded) + topRight;
 
   lines.push(topBar(width, bc));
-  lines.push(hex(bc)(BOX.v) + topMiddle + topRightPadded + hex(bc)(BOX.v));
+  lines.push(hex(bc)(BOX.v) + topContent + hex(bc)(BOX.v));
 
   // ── METHOD + PATH + STATUS ────────────────────────────────────────────────
   lines.push(divider(width, bc));
@@ -160,16 +162,16 @@ export function formatFull(
   const timeStr = hex(theme.time)(formatTime(entry.responseTime));
   const sizeStr = hex(theme.dim)(formatBytes(entry.contentLength));
 
-  // Right side: status + time + size
   const rightContent = statusStr + "  " + timeStr + "  " + sizeStr + " ";
   const rightLen = stripAnsi(rightContent).length;
 
-  // Path — truncate if needed
-  const availPath = inner - 8 - rightLen - 1;
+  // Content space inside pad(): inner - 1 (the leading space pad() adds)
+  const contentWidth = inner - 1;
+  const availPath = contentWidth - 8 - rightLen;
   const pathStr = truncate(hex(theme.value)(entry.path), availPath);
 
   const rowGap = " ".repeat(
-    Math.max(1, inner - 8 - stripAnsi(pathStr).length - rightLen + 1),
+    Math.max(1, contentWidth - 8 - stripAnsi(pathStr).length - rightLen),
   );
 
   lines.push(
@@ -182,8 +184,11 @@ export function formatFull(
     lines.push(divider(width, bc, hex(theme.dim)("query")));
     for (const [k, v] of Object.entries(entry.query)) {
       const val = Array.isArray(v) ? v.join(", ") : v;
-      const keyStr = hex(theme.key)(k.padEnd(20));
-      const valStr = truncate(hex(theme.value)(String(val)), inner - 22);
+      const keyColWidth = Math.min(20, Math.floor((contentWidth - 1) / 3));
+      const keyDisplay = k.padEnd(keyColWidth);
+      const keyStr = hex(theme.key)(keyDisplay);
+      const valMaxLen = Math.max(20, contentWidth - keyColWidth - 1);
+      const valStr = truncate(hex(theme.value)(String(val)), valMaxLen);
       lines.push(pad(keyStr + " " + valStr));
     }
   }
@@ -202,14 +207,17 @@ export function formatFull(
         const isRedacted = redacted.has(k.toLowerCase());
         const rawVal = Array.isArray(v) ? v.join(", ") : String(v ?? "");
         const displayVal = isRedacted ? "••••••••" : rawVal;
-        const keyStr = hex(theme.key)(k.toLowerCase().padEnd(28));
+        const keyColWidth = Math.min(28, Math.floor((contentWidth - 1) / 3));
+        const keyDisplay = k.toLowerCase().padEnd(keyColWidth);
+        const keyStr = hex(theme.key)(keyDisplay);
+        const valMaxLen = Math.max(20, contentWidth - keyColWidth - 1);
         const valStr = truncate(
           isRedacted
             ? hex("#f87171")(displayVal)
             : hex(theme.value)(displayVal),
-          inner - 30,
+          valMaxLen,
         );
-        lines.push(pad(keyStr + valStr));
+        lines.push(pad(keyStr + " " + valStr));
       }
     }
   }
@@ -234,7 +242,8 @@ export function formatFull(
           break;
         }
         charCount += line.length;
-        lines.push(pad(hex(theme.value)(line.substring(0, inner - 1))));
+        // contentWidth - 1 to leave a 1-char right margin inside the border
+        lines.push(pad(hex(theme.value)(line.substring(0, contentWidth - 1))));
       }
 
       if (truncated) {
