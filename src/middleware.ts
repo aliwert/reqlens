@@ -16,11 +16,29 @@ const DEFAULT_OPTIONS: Required<ReqLensOptions> = {
   compact: false,
 };
 
+/**
+ * FIX #5: Escape all regex special characters in the pattern BEFORE replacing
+ * '*' with '.*'. Without this, literal dots in paths like '/api/v1.0/users'
+ * would match any character, and characters like '+', '(', ')' would throw
+ * or produce wrong matches.
+ */
 function matchesExclude(path: string, patterns: string[]): boolean {
   return patterns.some((pattern) => {
-    const regex = new RegExp("^" + pattern.replace(/\*/g, ".*") + "$");
+    const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
+    const regex = new RegExp("^" + escaped.replace(/\*/g, ".*") + "$");
     return regex.test(path);
   });
+}
+
+/**
+ * FIX #4: Normalize IPv6-mapped IPv4 addresses (::ffff:127.0.0.1 → 127.0.0.1)
+ * and the IPv6 loopback (::1 → 127.0.0.1) so the display is always clean.
+ */
+function normalizeIp(raw: string): string {
+  if (raw === "::1") return "127.0.0.1";
+  const v4mapped = raw.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (v4mapped) return v4mapped[1];
+  return raw;
 }
 
 function getIp(req: Request): string {
@@ -29,9 +47,9 @@ function getIp(req: Request): string {
     const ip = Array.isArray(forwarded)
       ? forwarded[0]
       : forwarded.split(",")[0];
-    return ip.trim();
+    return normalizeIp(ip.trim());
   }
-  return req.socket?.remoteAddress ?? "unknown";
+  return normalizeIp(req.socket?.remoteAddress ?? "unknown");
 }
 
 export function reqlens(userOptions: ReqLensOptions = {}): RequestHandler {
@@ -45,7 +63,6 @@ export function reqlens(userOptions: ReqLensOptions = {}): RequestHandler {
     res: Response,
     next: NextFunction,
   ): void {
-    // Skip excluded paths
     if (matchesExclude(req.path, opts.exclude)) {
       return next();
     }
@@ -64,7 +81,6 @@ export function reqlens(userOptions: ReqLensOptions = {}): RequestHandler {
       ip: getIp(req),
     };
 
-    // Hook into response finish
     res.on("finish", () => {
       const elapsedNs = process.hrtime.bigint() - start;
       const elapsedMs = Number(elapsedNs) / 1_000_000;

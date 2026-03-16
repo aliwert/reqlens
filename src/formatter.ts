@@ -40,10 +40,25 @@ function stripAnsi(str: string): string {
   return str.replace(/\x1B\[[0-9;]*m/g, "");
 }
 
-function truncate(str: string, maxLen: number): string {
-  if (str.length <= maxLen) return str;
+/**
+ * FIX #1: truncate() must operate on plain text BEFORE colorizing.
+ * Receiving an already-colored (ANSI-wrapped) string means str.length counts
+ * escape bytes, not visible chars — the guard fires at the wrong point and
+ * slice() can cut through an escape sequence, leaving the terminal stuck in
+ * a color state.
+ *
+ * New signature: takes the raw value + a color function separately.
+ * Truncation happens on plain text, then color is applied to the result.
+ */
+function truncate(
+  raw: string,
+  maxLen: number,
+  colorFn: (s: string) => string,
+): string {
+  if (raw.length <= maxLen) return colorFn(raw);
   return (
-    str.slice(0, maxLen) + hex("#555555")(`… +${str.length - maxLen} chars`)
+    colorFn(raw.slice(0, maxLen)) +
+    hex("#555555")(`… +${raw.length - maxLen} chars`)
   );
 }
 
@@ -61,7 +76,7 @@ const BOX = {
 };
 
 function boxLine(content: string, width: number, borderColor: string): string {
-  const inner = width - 2; // subtract left and right borders
+  const inner = width - 2;
   const visible = stripAnsi(content);
   const pad = Math.max(0, inner - visible.length);
   return (
@@ -118,10 +133,6 @@ export function formatFull(
 ): string {
   const theme = themes[opts.theme];
   const width = Math.min(terminalWidth(), 110);
-
-  // inner: usable chars between the two border │ characters.
-  // Content rows go through pad() which prepends one space, so they have
-  // (inner - 1) chars of actual content space. Defined here for those rows.
   const inner = width - 2;
 
   const mColor = methodColor(entry.method, theme);
@@ -133,9 +144,10 @@ export function formatFull(
   // pad() wraps content with one leading space inside the border
   const pad = (content: string) => boxLine(" " + content, width, bc);
 
+  // contentWidth: usable chars inside pad() rows (inner minus the leading space)
+  const contentWidth = inner - 1;
+
   // ── TOP BAR ──────────────────────────────────────────────────────────────
-  // Top bar does NOT go through pad(), so it fills the full (inner) chars
-  // between the two │ borders — do NOT subtract any extra padding here.
   const labelStr = hex(theme.label)("◈ " + opts.label);
   const tsStr = hex(theme.dim)(entry.timestamp.toLocaleTimeString());
   const ipStr = hex(theme.dim)(entry.ip);
@@ -147,7 +159,6 @@ export function formatFull(
   const topLeftLen = stripAnsi(topLeft).length;
   const topRightLen = stripAnsi(topRight).length;
 
-  // inner = width - 2: exactly the space between the two │ chars
   const gapNeeded = Math.max(1, inner - topLeftLen - topRightLen);
   const topContent = topLeft + " ".repeat(gapNeeded) + topRight;
 
@@ -165,13 +176,15 @@ export function formatFull(
   const rightContent = statusStr + "  " + timeStr + "  " + sizeStr + " ";
   const rightLen = stripAnsi(rightContent).length;
 
-  // Content space inside pad(): inner - 1 (the leading space pad() adds)
-  const contentWidth = inner - 1;
   const availPath = contentWidth - 8 - rightLen;
-  const pathStr = truncate(hex(theme.value)(entry.path), availPath);
+  // FIX #1 applied: truncate raw path first, then color
+  const pathStr = truncate(entry.path, availPath, hex(theme.value));
 
   const rowGap = " ".repeat(
-    Math.max(1, contentWidth - 8 - stripAnsi(pathStr).length - rightLen),
+    Math.max(
+      1,
+      contentWidth - 8 - entry.path.slice(0, availPath).length - rightLen,
+    ),
   );
 
   lines.push(
@@ -183,12 +196,12 @@ export function formatFull(
   if (opts.showQuery && queryKeys.length > 0) {
     lines.push(divider(width, bc, hex(theme.dim)("query")));
     for (const [k, v] of Object.entries(entry.query)) {
-      const val = Array.isArray(v) ? v.join(", ") : v;
+      const rawVal = Array.isArray(v) ? v.join(", ") : String(v);
       const keyColWidth = Math.min(20, Math.floor((contentWidth - 1) / 3));
-      const keyDisplay = k.padEnd(keyColWidth);
-      const keyStr = hex(theme.key)(keyDisplay);
+      const keyStr = hex(theme.key)(k.padEnd(keyColWidth));
       const valMaxLen = Math.max(20, contentWidth - keyColWidth - 1);
-      const valStr = truncate(hex(theme.value)(String(val)), valMaxLen);
+      // FIX #1 applied: pass raw value + color function separately
+      const valStr = truncate(rawVal, valMaxLen, hex(theme.value));
       lines.push(pad(keyStr + " " + valStr));
     }
   }
@@ -205,18 +218,17 @@ export function formatFull(
       lines.push(divider(width, bc, hex(theme.dim)("headers")));
       for (const [k, v] of filteredHeaders) {
         const isRedacted = redacted.has(k.toLowerCase());
-        const rawVal = Array.isArray(v) ? v.join(", ") : String(v ?? "");
-        const displayVal = isRedacted ? "••••••••" : rawVal;
+        const rawVal = isRedacted
+          ? "••••••••"
+          : Array.isArray(v)
+            ? v.join(", ")
+            : String(v ?? "");
         const keyColWidth = Math.min(28, Math.floor((contentWidth - 1) / 3));
-        const keyDisplay = k.toLowerCase().padEnd(keyColWidth);
-        const keyStr = hex(theme.key)(keyDisplay);
+        const keyStr = hex(theme.key)(k.toLowerCase().padEnd(keyColWidth));
         const valMaxLen = Math.max(20, contentWidth - keyColWidth - 1);
-        const valStr = truncate(
-          isRedacted
-            ? hex("#f87171")(displayVal)
-            : hex(theme.value)(displayVal),
-          valMaxLen,
-        );
+        // FIX #1 applied: truncate plain text, color after
+        const valColor = isRedacted ? hex("#f87171") : hex(theme.value);
+        const valStr = truncate(rawVal, valMaxLen, valColor);
         lines.push(pad(keyStr + " " + valStr));
       }
     }
@@ -242,7 +254,7 @@ export function formatFull(
           break;
         }
         charCount += line.length;
-        // contentWidth - 1 to leave a 1-char right margin inside the border
+        // Body lines: plain text sliced first, THEN colorized — already correct
         lines.push(pad(hex(theme.value)(line.substring(0, contentWidth - 1))));
       }
 
